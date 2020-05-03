@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+
+import argparse
+import base64
+import codecs
+import os
+import sys
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import padding as sym_padding
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.ciphers import Cipher
+from cryptography.hazmat.primitives.ciphers.algorithms import AES, TripleDES
+from cryptography.hazmat.primitives.ciphers.modes import CBC, OFB, CTR
+from cryptography.hazmat.primitives.hashes import SHA256, SHA512, SHA3_256, SHA3_512
+
+from CryptoData import CryptoData
+
+symmetric_ = {'AES': AES, 'TripleDES': TripleDES, None: AES}
+mode_ = {'CBC': CBC, 'OFB': OFB, 'CTR': CTR, None: CBC}
+sym_key_size_ = {
+    'AES':
+        {'128': 128, '192': 192, '256': 256, None: 128},
+    'TripleDES':
+        {'128': 128, '192': 192, None: 128},
+    None:
+        {'128': 128, '192': 192, '256': 256, None: 128}
+}
+asym_key_size_ = {
+    'RSA':
+        {'1024': 1024, '2048': 2048, '4096': 4096, '8192': 8192, None: 2048},
+    None:
+        {'1024': 1024, '2048': 2048, '4096': 4096, '8192': 8192, None: 2048}
+}
+asymmetric_ = {'RSA': rsa, None: rsa}
+hash_ = {'SHA256': SHA256, 'SHA512': SHA512, 'SHA3_256': SHA3_256, 'SHA3_512': SHA3_512, None: SHA256}
+
+
+def extract_path(io):
+    split = io.rfind('/')
+    if split != -1:
+        path = io[:split + 1]
+    else:
+        path = './'
+    return path
+
+
+def int2hex(i):
+    h = hex(i)[2:].encode()
+    return h if len(h) % 2 == 0 else b'0' + h
+
+
+def hex2int(h):
+    return int(h, 16)
+
+
+def create_sym_ciphertext(plaintext, file_name, secret_key):
+    """
+    Symmetric encryption
+    """
+    algo, mode = secret_key.package['Method'][0].split(' ')
+    s_key_hex = secret_key.package['Secret key']
+    s_key = codecs.decode(s_key_hex, 'hex')
+    iv = os.urandom(symmetric_[algo].block_size // 8)
+    cipher = Cipher(symmetric_[algo](s_key), mode_[mode](iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    if mode == 'CBC':
+        padder = sym_padding.PKCS7(symmetric_[algo].block_size).padder()
+        plaintext = padder.update(plaintext) + padder.finalize()
+    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+    ciphertext = base64.b64encode(ciphertext)
+
+    ciphertext = CryptoData(desc='Crypted file', fname=file_name, methods=secret_key.package['Method'],
+                            iv=codecs.encode(iv, 'hex'), data=ciphertext)
+
+    return ciphertext
+
+
+def read_sym_ciphertext(ciphertext, secret_key):
+    """
+    Symmetric decryption
+    """
+    s_key_hex = secret_key.package['Secret key']
+    s_key = codecs.decode(s_key_hex, 'hex')
+    iv = codecs.decode(ciphertext.package['Initialization vector'], 'hex')
+    algo, mode = secret_key.package['Method'][0].split(' ')
+    cipher = Cipher(symmetric_[algo](s_key), mode_[mode](iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    ciphertext = base64.b64decode(ciphertext.package['Data'])
+    plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    if mode == 'CBC':
+        unpadder = sym_padding.PKCS7(symmetric_[algo].block_size).unpadder()
+        plaintext = unpadder.update(plaintext) + unpadder.finalize()
+
+    return plaintext
+
+
+def create_rsa_ciphertext(plaintext, file_name, public_key):
+    """
+    RSA encryption
+    """
+    e, n = hex2int(public_key.package['Public exponent']), hex2int(public_key.package['Modulus'])
+    p_key = rsa.RSAPublicNumbers(e, n).public_key(default_backend())
+    ciphertext = p_key.encrypt(
+        plaintext,
+        asym_padding.OAEP(
+            mgf=asym_padding.MGF1(algorithm=SHA256()),
+            algorithm=SHA256(),
+            label=None
+        )
+    )
+    ciphertext = base64.b64encode(ciphertext)
+
+    ciphertext = CryptoData(desc='Crypted file', fname=file_name, methods=public_key.package['Method'], data=ciphertext)
+
+    return ciphertext
+
+
+def read_rsa_ciphertext(ciphertext, private_key):
+    """
+    RSA decryption
+    """
+    n, e, d = hex2int(private_key.package['Modulus']), \
+              hex2int(private_key.package['Public exponent']), \
+              hex2int(private_key.package['Private exponent'])
+    p_key = construct_key(n, e, d)
+    plaintext = p_key.decrypt(
+        base64.b64decode(ciphertext.package['Data']),
+        asym_padding.OAEP(
+            mgf=asym_padding.MGF1(algorithm=SHA256()),
+            algorithm=SHA256(),
+            label=None
+        )
+    )
+
+    return plaintext
+
+
+def create_envelope(plaintext, file_name, secret_key, public_key):
+    """
+    Envelope generator
+    """
+    methods = list(secret_key.package['Method'])
+    methods += public_key.package['Method']
+
+    algo, mode = methods[0].split(' ')
+    s_key_hex = secret_key.package['Secret key']
+    s_key = codecs.decode(s_key_hex, 'hex')
+    s_key_len_hex = int2hex(len(s_key) * 8)
+    iv = os.urandom(symmetric_[algo].block_size // 8)
+    cipher = Cipher(symmetric_[algo](s_key), mode_[mode](iv), backend=default_backend())
+    encryptor = cipher.encryptor()
+    if mode == 'CBC':
+        padder = sym_padding.PKCS7(symmetric_[algo].block_size).padder()
+        plaintext = padder.update(plaintext) + padder.finalize()
+    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+    env_data = base64.b64encode(ciphertext)
+
+    e, n = hex2int(public_key.package['Public exponent']), hex2int(public_key.package['Modulus'])
+    p_key_len_hex = public_key.package['Key length'][0]
+    p_key = rsa.RSAPublicNumbers(e, n).public_key(default_backend())
+    ciphertext = p_key.encrypt(
+        s_key,
+        asym_padding.OAEP(
+            mgf=asym_padding.MGF1(algorithm=SHA256()),
+            algorithm=SHA256(),
+            label=None
+        )
+    )
+    env_key = codecs.encode(ciphertext, 'hex')
+
+    envelope = CryptoData(desc='Envelope', fname=file_name, methods=methods,
+                          key_len=[s_key_len_hex, p_key_len_hex], iv=codecs.encode(iv, 'hex'), env_data=env_data,
+                          env_key=env_key)
+
+    return envelope
+
+
+def read_envelope(envelope, private_key):
+    """
+    Envelope reader
+    """
+    n, e, d = hex2int(private_key.package['Modulus']), \
+              hex2int(private_key.package['Public exponent']), \
+              hex2int(private_key.package['Private exponent'])
+    p_key = construct_key(n, e, d)
+    s_key = p_key.decrypt(
+        codecs.decode(envelope.package['Envelope crypt key'], 'hex'),
+        asym_padding.OAEP(
+            mgf=asym_padding.MGF1(algorithm=SHA256()),
+            algorithm=SHA256(),
+            label=None
+        )
+    )
+    iv = codecs.decode(envelope.package['Initialization vector'], 'hex')
+    algo, mode = envelope.package['Method'][0].split(' ')
+    cipher = Cipher(symmetric_[algo](s_key), mode_[mode](iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    ciphertext = base64.b64decode(envelope.package['Envelope data'])
+    plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    if mode == 'CBC':
+        unpadder = sym_padding.PKCS7(symmetric_[algo].block_size).unpadder()
+        plaintext = unpadder.update(plaintext) + unpadder.finalize()
+
+    return plaintext
+
+
+def create_signature(plaintext, file_name, hash, private_key):
+    """
+    Signature generator
+    """
+    methods = [hash] + private_key.package['Method']
+
+    hash = hash_[hash]()
+    h_len_hex = int2hex(hash.digest_size * 8)
+
+    p_key_len_hex = private_key.package['Key length'][0]
+    n, e, d = hex2int(private_key.package['Modulus']), \
+              hex2int(private_key.package['Public exponent']), \
+              hex2int(private_key.package['Private exponent'])
+    p_key = construct_key(n, e, d)
+    sign = p_key.sign(
+        plaintext,
+        asym_padding.PSS(
+            mgf=asym_padding.MGF1(algorithm=SHA256()),
+            salt_length=asym_padding.PSS.MAX_LENGTH
+        ),
+        hash
+    )
+    sign = codecs.encode(sign, 'hex')
+
+    signature = CryptoData(desc='Signature', fname=file_name, methods=methods, key_len=[h_len_hex, p_key_len_hex],
+                           sign=sign)
+
+    return signature
+
+
+def check_signature(plaintext, signature, public_key):
+    """
+    Signature verifier
+    """
+    hash = signature.package['Method'][0]
+    hash = hash_[hash]()
+    sign = codecs.decode(signature.package['Signature'], 'hex')
+
+    e, n = hex2int(public_key.package['Public exponent']), hex2int(public_key.package['Modulus'])
+    p_key = rsa.RSAPublicNumbers(e, n).public_key(default_backend())
+    try:
+        p_key.verify(
+            sign,
+            plaintext,
+            asym_padding.PSS(
+                mgf=asym_padding.MGF1(SHA256()),
+                salt_length=asym_padding.PSS.MAX_LENGTH
+            ),
+            hash
+        )
+    except InvalidSignature:
+        return False
+
+    return True
+
+
+def generate_secret_key(symmetric, sym_key_size, sym_mode):
+    """
+    Secret key generator
+    """
+    key_size = sym_key_size_[symmetric][sym_key_size]
+    key = codecs.encode(os.urandom(key_size // 8), 'hex')
+    secret_key = CryptoData(desc='Secret key', methods=[symmetric + ' ' + sym_mode], sec_key=key)
+    return secret_key
+
+
+def generate_rsa_key_pair(asymmetric, asym_key_size, public_exponent):
+    """
+    RSA key generator
+    """
+    key_size = asym_key_size_[asymmetric][asym_key_size]
+    key_size_hex = int2hex(key_size)
+    pr_key = rsa.generate_private_key(public_exponent=public_exponent, key_size=key_size,
+                                      backend=default_backend())
+    pr_nums = pr_key.private_numbers()
+    pu_key = pr_key.public_key()
+    pu_nums = pu_key.public_numbers()
+    n, e, d = int2hex(pu_nums.n), int2hex(pu_nums.e), int2hex(pr_nums.d)
+    private_key = CryptoData(desc='Private key', methods=['RSA'], key_len=[key_size_hex], mod=n, e=e, d=d)
+    public_key = CryptoData(desc='Public key', methods=['RSA'], key_len=[key_size_hex], mod=n, e=e)
+
+    return private_key, public_key
+
+
+def construct_key(n, e, d):
+    """
+    RSA key constructor
+    """
+    p, q = rsa.rsa_recover_prime_factors(n, e, d)
+    iqmp = rsa.rsa_crt_iqmp(p, q)
+    dmp1 = rsa.rsa_crt_dmp1(d, p)
+    dmq1 = rsa.rsa_crt_dmq1(d, q)
+    pu_nums = rsa.RSAPublicNumbers(e, n)
+    pr_nums = rsa.RSAPrivateNumbers(p, q, d, dmp1, dmq1, iqmp, pu_nums)
+    return pr_nums.private_key(default_backend())
+
+
+def check_or_generate_secret_key(file_name, secret_key, sym_key_size, sym_mode, symmetric):
+    """
+    Symmetric encryption key checker/generator
+    """
+    if secret_key is not None:
+        secret_key = CryptoData().read(secret_key)
+        assert secret_key.package['Description'] is not None
+        assert secret_key.package['Method'] is not None
+        assert secret_key.package['Secret key'] is not None
+    else:
+        secret_key = generate_secret_key(symmetric, sym_key_size, sym_mode)
+        secret_key.write(file_name.split('.')[0] + '_secret_key.dat')
+    return secret_key
+
+
+def require_secret_key(secret_key):
+    """
+    Symmetric encryption key checker
+    """
+    if secret_key is not None:
+        secret_key = CryptoData().read(secret_key)
+        assert secret_key.package['Description'] is not None
+        assert secret_key.package['Method'] is not None
+        assert secret_key.package['Secret key'] is not None
+    else:
+        print('secret key needed')
+        sys.exit(1)
+    return secret_key
+
+
+def require_public_key(public_key):
+    """
+    RSA public key checker
+    """
+    if public_key is not None:
+        public_key = CryptoData().read(public_key)
+        assert public_key.package['Description'] is not None
+        assert public_key.package['Method'] is not None
+        assert public_key.package['Key length'] is not None
+        assert public_key.package['Modulus'] is not None
+        assert public_key.package['Public exponent'] is not None
+    else:
+        print('public key needed')
+        sys.exit(1)
+    return public_key
+
+
+def check_or_generate_private_key(asym_key_size, asymmetric, file_name, private_key, public_exponent):
+    """
+    RSA key checker/generator
+    """
+    if private_key is None:
+        private_key, public_key = generate_rsa_key_pair(asymmetric, asym_key_size, public_exponent)
+        private_key.write(file_name.split('.')[0] + '_private_key.dat')
+        public_key.write(file_name.split('.')[0] + '_public_key.dat')
+    else:
+        private_key = CryptoData().read(private_key)
+        assert private_key.package['Description'] is not None
+        assert private_key.package['Method'] is not None
+        assert private_key.package['Key length'] is not None
+        assert private_key.package['Modulus'] is not None
+        assert private_key.package['Private exponent'] is not None
+    return private_key
+
+
+def require_private_key(private_key):
+    """
+    RSA key checker
+    """
+    if private_key is not None:
+        private_key = CryptoData().read(private_key)
+        assert private_key.package['Description'] is not None
+        assert private_key.package['Method'] is not None
+        assert private_key.package['Key length'] is not None
+        assert private_key.package['Modulus'] is not None
+        assert private_key.package['Public exponent'] is not None
+        assert private_key.package['Private exponent'] is not None
+    else:
+        print('private key needed')
+        sys.exit(1)
+    return private_key
+
+
+def combine_into_seal(envelope, signature):
+    """
+    Combine the envelope and the signature into a seal
+    """
+    file_name = envelope.package['File name']
+    methods = envelope.package['Method'] + signature.package['Method']
+    key_lens = envelope.package['Key length'] + signature.package['Key length']
+    iv = envelope.package['Initialization vector']
+    env_data = envelope.package['Envelope data']
+    env_key = envelope.package['Envelope crypt key']
+    sign = signature.package['Signature']
+    seal = CryptoData(desc='Seal', fname=file_name, methods=methods, key_len=key_lens, iv=iv,
+                      env_data=env_data, env_key=env_key, sign=sign)
+    return seal
+
+
+def extract_signature(seal):
+    """
+    Signature from seal extractor
+    """
+    return CryptoData(desc='Signature', fname=seal.package['File name'], methods=seal.package['Method'][2:],
+                      key_len=seal.package['Key length'][2:], sign=seal.package['Signature'])
+
+
+def extract_envelope(seal):
+    """
+    Envelope from seal extractor
+    """
+    return CryptoData(desc='Envelope', fname=seal.package['File name'], methods=seal.package['Method'][:2],
+                      key_len=seal.package['Key length'][:2], iv=seal.package['Initialization vector'],
+                      env_data=seal.package['Envelope data'], env_key=seal.package['Envelope crypt key'])
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="crypto is a Python3 CLI program for generating encryption/decryption keys, encrypting files, "
+                    "creating digital envelopes, digital signatures, and digital seals which are digitally signed "
+                    "digital envelopes",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument('mode',
+                        help='mode of operation, one of [create | read]')
+    parser.add_argument('command',
+                        help='operation to be executed, one of [public | secret | symmetric | asymmetric | envelope | '
+                             'signature | seal]')
+    parser.add_argument('io',
+                        help='output file prefix for [public, secret] OR input file path for [symmetric, '
+                             'asymmetric, envelope, signature, seal]')
+    parser.add_argument("-k", "--secret-key",
+                        help="secret key file path")
+    parser.add_argument("-s", "--symmetric",
+                        help="symmetric encryption algorithm",
+                        choices=['AES', 'TripleDES'],
+                        default='AES')
+    parser.add_argument("-S", "--sym-key-size",
+                        help="size of symmetric encryption key in bits, for TripleDES one of [128, 192], for AES "
+                             "one of [128, 192, 256]",
+                        choices=['128', '192', '256'],
+                        default='128')
+    parser.add_argument("-m", "--sym-mode",
+                        help="symmetric encryption mode",
+                        choices=['CBC', 'OFB', 'CTR'],
+                        default='CBC')
+    parser.add_argument("-p", "--private-key",
+                        help="private key file path")
+    parser.add_argument("-P", "--public-key",
+                        help="public key file path")
+    parser.add_argument("-a", "--asymmetric",
+                        help="asymmetric encryption algorithm",
+                        choices=['RSA'],
+                        default='RSA')
+    parser.add_argument("-e", "--public-exponent",
+                        help="public exponent for RSA asymmetric key generation",
+                        type=int,
+                        default=65537)
+    parser.add_argument("-A", "--asym-key-size",
+                        help="size of symmetric encryption key in bits",
+                        choices=['1024', '2048', '4096', '8192'],
+                        default='2048')
+    parser.add_argument("-H", "--hash",
+                        help="hashing algorithm to be used for signing",
+                        choices=['SHA256', 'SHA512', 'SHA3_256', 'SHA3_512'],
+                        default='SHA256')
+    args = parser.parse_args()
+
+    secret_key = args.secret_key
+    symmetric = args.symmetric
+    sym_key_size = args.sym_key_size
+    sym_mode = args.sym_mode
+
+    private_key = args.private_key
+    public_key = args.public_key
+    asymmetric = args.asymmetric
+    asym_key_size = args.asym_key_size
+    public_exponent = args.public_exponent
+
+    hash = args.hash
+
+    mode = args.mode
+    command = args.command
+    io = args.io
+
+    prefix = 'out'
+    file_name = None
+    plaintext = b''
+
+    if mode == 'read':
+        if command == 'symmetric':
+            secret_key = require_secret_key(secret_key)
+            ciphertext = CryptoData().read(io)
+            plaintext = read_sym_ciphertext(ciphertext, secret_key)
+            path = extract_path(io)
+            with open(path + 'decrypted_' + ciphertext.package['File name'], 'wb') as f:
+                f.write(plaintext)
+
+        elif command == 'asymmetric':
+            private_key = require_private_key(private_key)
+            ciphertext = CryptoData().read(io)
+            plaintext = read_rsa_ciphertext(ciphertext, private_key)
+            path = extract_path(io)
+            with open(path + 'decrypted_' + ciphertext.package['File name'], 'wb') as f:
+                f.write(plaintext)
+
+        elif command == 'envelope':
+            private_key = require_private_key(private_key)
+            envelope = CryptoData().read(io)
+            plaintext = read_envelope(envelope, private_key)
+            path = extract_path(io)
+            with open(path + 'decrypted_' + envelope.package['File name'], 'wb') as f:
+                f.write(plaintext)
+
+        elif command == 'signature':
+            public_key = require_public_key(public_key)
+            signature = CryptoData().read(io)
+            path = extract_path(io)
+            with open(path + signature.package['File name'], 'rb') as file:
+                plaintext = file.read()
+            verified = check_signature(plaintext, signature, public_key)
+            print('signature verification ' + ('successful' if verified else 'unsuccessful'))
+
+        elif command == 'seal':
+            public_key = require_public_key(public_key)
+            private_key = require_private_key(private_key)
+
+            seal = CryptoData().read(io)
+            signature = extract_signature(seal)
+
+            env_data = seal.package['Envelope data']
+            env_key = seal.package['Envelope crypt key']
+            env = base64.b64decode(env_data) + codecs.decode(env_key, 'hex')
+
+            if not check_signature(env, signature, public_key):
+                print('signature verification unsuccessful')
+                print('aborting')
+                sys.exit(1)
+
+            envelope = extract_envelope(seal)
+            plaintext = read_envelope(envelope, private_key)
+            path = extract_path(io)
+            with open(path + 'decrypted_' + envelope.package['File name'], 'wb') as f:
+                f.write(plaintext)
+
+        else:
+            print('unknown command')
+
+    elif mode == 'create':
+        if command in ['secret', 'public']:
+            prefix = io
+        else:
+            with open(io, 'rb') as file:
+                plaintext = file.read()
+            file_name = io.split('/')[-1]
+
+        if command == 'public':
+            private_key, public_key = generate_rsa_key_pair(asymmetric, asym_key_size, public_exponent)
+            private_key.write(prefix + '_private_key.dat')
+            public_key.write(prefix + '_public_key.dat')
+
+        elif command == 'secret':
+            secret_key = generate_secret_key(symmetric, sym_key_size, sym_mode)
+            secret_key.write(prefix + '_secret_key.dat')
+
+        elif command == 'symmetric':
+            secret_key = check_or_generate_secret_key(file_name, secret_key, sym_key_size, sym_mode, symmetric)
+            ciphertext = create_sym_ciphertext(plaintext, file_name, secret_key)
+            path = extract_path(io)
+            ciphertext.write(path + 'encrypted_' + file_name.split('.')[0] + '.dat')
+
+        elif command == 'asymmetric':
+            public_key = require_public_key(public_key)
+            ciphertext = create_rsa_ciphertext(plaintext, file_name, public_key)
+            path = extract_path(io)
+            ciphertext.write(path + 'encrypted_' + file_name.split('.')[0] + '.dat')
+
+        elif command == 'envelope':
+            secret_key = check_or_generate_secret_key(file_name, secret_key, sym_key_size, sym_mode, symmetric)
+            public_key = require_public_key(public_key)
+            envelope = create_envelope(plaintext, file_name, secret_key, public_key)
+            path = extract_path(io)
+            envelope.write(path + 'envelope_' + file_name.split('.')[0] + '.dat')
+
+        elif command == 'signature':
+            private_key = check_or_generate_private_key(asym_key_size, asymmetric, file_name, private_key,
+                                                        public_exponent)
+            signature = create_signature(plaintext, file_name, hash, private_key)
+            path = extract_path(io)
+            signature.write(path + 'signature_' + file_name.split('.')[0] + '.dat')
+
+        elif command == 'seal':
+            secret_key = check_or_generate_secret_key(file_name, secret_key, sym_key_size, sym_mode, symmetric)
+            public_key = require_public_key(public_key)
+            envelope = create_envelope(plaintext, file_name, secret_key, public_key)
+
+            env_data = envelope.package['Envelope data']
+            env_key = envelope.package['Envelope crypt key']
+            env = base64.b64decode(env_data) + codecs.decode(env_key, 'hex')
+
+            private_key = check_or_generate_private_key(asym_key_size, asymmetric, file_name, private_key,
+                                                        public_exponent)
+            signature = create_signature(env, file_name, hash, private_key)
+
+            seal = combine_into_seal(envelope, signature)
+            path = extract_path(io)
+            seal.write(path + 'seal_' + file_name.split('.')[0] + '.dat')
+
+        else:
+            print('unknown command')
+
+    else:
+        print('unknown mode of operation')
+
+
+if __name__ == "__main__":
+    main()
